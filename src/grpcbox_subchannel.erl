@@ -48,17 +48,35 @@ init([Name, Channel, Endpoint, Encoding, StatsHandler]) ->
                              endpoint=Endpoint,
                              channel=Channel}}.
 
-info_map({http, Host, 80, _}, Encoding, StatsHandler) ->
+%% In case of unix socket transport
+%% (defined as tuple {local, _UnixPath} in gen_tcp),
+%% there is no standard on what the authority field value
+%% should be, as HTTP/2 over UDS is not formally specified.
+%% To follow other gRPC implementations' behavior,
+%% the "localhost" value is used.
+info_map({Scheme, {local, _UnixPath} = Host, Port, _, _}, Encoding, StatsHandler) ->
+    case {Scheme, Port} of
+        %% The ssl layer is not functional over unix sockets currently,
+        %% and the port is strictly required to be 0 by gen_tcp.
+        {http, 0} ->
+            #{authority => <<"localhost">>,
+              scheme => <<"http">>,
+              encoding => Encoding,
+              stats_handler => StatsHandler};
+        _ ->
+            error({badarg, [Scheme, Host, Port]})
+    end;
+info_map({http, Host, 80, _, _}, Encoding, StatsHandler) ->
     #{authority => list_to_binary(Host),
       scheme => <<"http">>,
       encoding => Encoding,
       stats_handler => StatsHandler};
-info_map({https, Host, 443, _}, Encoding, StatsHandler) ->
+info_map({https, Host, 443, _, _}, Encoding, StatsHandler) ->
     #{authority => list_to_binary(Host),
       scheme => <<"https">>,
       encoding => Encoding,
       stats_handler => StatsHandler};
-info_map({Scheme, Host, Port, _}, Encoding, StatsHandler) ->
+info_map({Scheme, Host, Port, _, _}, Encoding, StatsHandler) ->
     #{authority => list_to_binary(Host ++ ":" ++ integer_to_list(Port)),
       scheme => atom_to_binary(Scheme, utf8),
       encoding => Encoding,
@@ -111,18 +129,10 @@ terminate(Reason, _State, #data{conn_pid=Pid,
     ok.
 
 connect(Data=#data{conn=undefined,
-                   endpoint={Transport, Host, Port, EndpointOptions}}, From, Actions) ->
-    % Get and delete non-ssl options from endpoint options, these are passed as connection settings
-    ConnectTimeout = proplists:get_value(connect_timeout, EndpointOptions, 5000),
-    TcpUserTimeout = proplists:get_value(tcp_user_timeout, EndpointOptions, 0),
-    EndpointOptions2 = proplists:delete(connect_timeout, EndpointOptions),
-    EndpointOptions3 = proplists:delete(tcp_user_timeout, EndpointOptions2),
-
-    case h2_client:start_link(Transport, Host, Port, options(Transport, EndpointOptions3),
-                              #{garbage_on_end => true,
-                                stream_callback_mod => grpcbox_client_stream,
-                                connect_timeout => ConnectTimeout,
-                                tcp_user_timeout => TcpUserTimeout}) of
+                   endpoint={Transport, Host, Port, SSLOptions, ConnectionSettings}}, From, Actions) ->
+    case h2_client:start_link(Transport, Host, Port, options(Transport, SSLOptions),
+                              ConnectionSettings#{garbage_on_end => true,
+                                                  stream_callback_mod => grpcbox_client_stream}) of
         {ok, Conn} ->
             Pid = h2_stream_set:connection(Conn),
             {next_state, ready, Data#data{conn=Conn, conn_pid=Pid}, Actions};
