@@ -37,11 +37,11 @@ terminate_child(ListenOpts) ->
 
 init(_Args) ->
     SupFlags = #{strategy => simple_one_for_one,
-                 intensity => 5,
-                 period => 10},
+                 intensity => 15,
+                 period => 60},
     ChildSpecs = [#{id => grpcbox_services_sup,
                     start => {grpcbox_services_sup, start_link, []},
                     type => supervisor,
-                    restart => transient,
+                    restart => permanent,
                     shutdown => 1000}],
     {ok, {SupFlags, ChildSpecs}}.

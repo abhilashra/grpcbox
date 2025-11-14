@@ -49,12 +49,18 @@ init([ServerOpts, GrpcOpts, ListenOpts, PoolOpts, TransportOpts, ServiceSupName]
     %% unique name for pool based on the ip and port it will listen on
     Name = pool_name(ListenOpts),
 
-    RestartStrategy = #{strategy => rest_for_one},
+    RestartStrategy = #{strategy => one_for_all,
+                       intensity => 15,
+                       period => 60},
     Pool = #{id => grpcbox_pool,
              start => {grpcbox_pool, start_link, [Name, chatterbox:settings(server, ServerOpts),
-                                                  ChatterboxOpts, TransportOpts]}},
+                                                  ChatterboxOpts, TransportOpts]},
+             restart => permanent,
+             shutdown => 5000},
     Socket = #{id => grpcbox_socket,
-               start => {grpcbox_socket, start_link, [Name, ListenOpts, PoolOpts]}},
+               start => {grpcbox_socket, start_link, [Name, ListenOpts, PoolOpts]},
+               restart => permanent,
+               shutdown => 5000},
     {ok, {RestartStrategy, [Pool, Socket]}}.
 
 %%

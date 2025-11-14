@@ -19,16 +19,16 @@ start_link() ->
 
 init(_Args) ->
     SupFlags = #{strategy => one_for_one,
-                 intensity => 5,
-                 period => 10},
+                 intensity => 20,
+                 period => 60},
     ChildSpecs = [#{id => grpcbox_services_simple_sup,
                     start => {grpcbox_services_simple_sup, start_link, []},
                     type => supervisor,
                     restart => permanent,
-                    shutdown => 5000},
+                    shutdown => 10000},
                   #{id => grpcbox_channel_sup,
                     start => {grpcbox_channel_sup, start_link, []},
                     type => supervisor,
                     restart => permanent,
-                    shutdown => 5000}],
+                    shutdown => 10000}],
     {ok, {SupFlags, ChildSpecs}}.
