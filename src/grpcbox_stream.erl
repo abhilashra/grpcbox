@@ -562,13 +562,15 @@ add_trailers_from_error_data(ErrorData, State) ->
     Trailers = maps:get(trailers, ErrorData, #{}),
     update_trailers(maps:to_list(Trailers), State).
 
-%% Log gRPC response at HTTP/2 level with transaction_id and timing
-log_grpc_response(undefined, _StartTime, _FullMethod, _StreamId, _Status) ->
-    ok;
-log_grpc_response(_TransactionId, undefined, _FullMethod, _StreamId, _Status) ->
-    ok;
+%% Log gRPC response at HTTP/2 level with x-request-id and timing
 log_grpc_response(RequestId, StartTime, FullMethod, StreamId, Status) ->
-    ElapsedMicros = erlang:monotonic_time(microsecond) - StartTime,
-    ElapsedMs = ElapsedMicros div 1000,
-    ?LOG_INFO("grpc_response: x_request_id=~s|stream_id=~p|method=~s|status=~s|elapsed_ms=~p",
-              [RequestId, StreamId, FullMethod, Status, ElapsedMs]).
+    ElapsedMs = case StartTime of
+                    undefined -> 0;
+                    _ -> (erlang:monotonic_time(microsecond) - StartTime) div 1000
+                end,
+    RequestIdStr = case RequestId of
+                       undefined -> <<"N/A">>;
+                       _ -> RequestId
+                   end,
+    io:format("grpc_response: x_request_id=~s|stream_id=~p|method=~s|status=~s|elapsed_ms=~p~n",
+              [RequestIdStr, StreamId, FullMethod, Status, ElapsedMs]).
