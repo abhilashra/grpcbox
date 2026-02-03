@@ -59,7 +59,9 @@
                 stream_id           :: stream_id(),
                 method              :: #method{} | undefined,
                 stats_handler       :: module() | undefined,
-                stats               :: term() | undefined}).
+                stats               :: term() | undefined,
+                transaction_id      :: binary() | undefined,
+                request_start_time  :: integer() | undefined}).
 
 -type t() :: #state{}.
 
@@ -95,7 +97,9 @@ init(Conn, StreamId, [Socket, ServicesTable, AuthFun, UnaryInterceptor,
                    stream_interceptor=StreamInterceptor,
                    socket=Socket,
                    handler=self(),
-                   stats_handler=StatsHandler},
+                   stats_handler=StatsHandler,
+                   transaction_id=undefined,
+                   request_start_time=undefined},
     {ok, State}.
 
 on_receive_headers(Headers, State=#state{ctx=_Ctx}) ->
@@ -124,12 +128,18 @@ on_receive_headers(Headers, State=#state{ctx=_Ctx}) ->
                    {<<"content-type">>, content_type(ContentType)}
                    | response_encoding(ResponseEncoding)],
 
+    %% Extract X-REQUEST-ID from headers for response logging
+    TransactionId = proplists:get_value(<<"x-request-id">>, Headers, undefined),
+    RequestStartTime = erlang:monotonic_time(microsecond),
+
     handle_service_lookup(Ctx2, string:lexemes(FullPath, "/"),
                           State1#state{resp_headers=RespHeaders,
                                        req_headers=Headers,
                                        request_encoding=RequestEncoding,
                                        response_encoding=ResponseEncoding,
-                                       content_type=ContentType}).
+                                       content_type=ContentType,
+                                       transaction_id=TransactionId,
+                                       request_start_time=RequestStartTime}).
 
 handle_service_lookup(Ctx, [Service, Method], State=#state{services_table=ServicesTable}) ->
     case ets:lookup(ServicesTable, {Service, Method}) of
@@ -340,11 +350,16 @@ end_stream(_Status, _Message, State=#state{trailers_sent=true}) ->
 end_stream(Status, Message, State=#state{connection=Conn,
                                          stream_id=StreamId,
                                          ctx=Ctx,
-                                         resp_trailers=Trailers}) ->
+                                         resp_trailers=Trailers,
+                                         transaction_id=TransactionId,
+                                         request_start_time=StartTime,
+                                         full_method=FullMethod}) ->
     EncodedTrailers = grpcbox_utils:encode_headers(Trailers),
     h2_connection:send_trailers(Conn, StreamId, [{<<"grpc-status">>, Status},
                                                     {<<"grpc-message">>, Message} | EncodedTrailers],
                                 [{send_end_stream, true}]),
+    %% Log gRPC response with transaction_id and elapsed time
+    log_grpc_response(TransactionId, StartTime, FullMethod, StreamId, Status),
     Ctx1 = ctx:with_value(Ctx, grpc_server_status, grpcbox_utils:status_to_string(Status)),
     State1 = stats_handler(Ctx1, rpc_end, {}, State),
     {ok, State1#state{trailers_sent=true}}.
@@ -546,3 +561,14 @@ maybe_encode_header_value(K, V) ->
 add_trailers_from_error_data(ErrorData, State) ->
     Trailers = maps:get(trailers, ErrorData, #{}),
     update_trailers(maps:to_list(Trailers), State).
+
+%% Log gRPC response at HTTP/2 level with transaction_id and timing
+log_grpc_response(undefined, _StartTime, _FullMethod, _StreamId, _Status) ->
+    ok;
+log_grpc_response(_TransactionId, undefined, _FullMethod, _StreamId, _Status) ->
+    ok;
+log_grpc_response(RequestId, StartTime, FullMethod, StreamId, Status) ->
+    ElapsedMicros = erlang:monotonic_time(microsecond) - StartTime,
+    ElapsedMs = ElapsedMicros div 1000,
+    ?LOG_INFO("grpc_response: x_request_id=~s|stream_id=~p|method=~s|status=~s|elapsed_ms=~p",
+              [RequestId, StreamId, FullMethod, Status, ElapsedMs]).
