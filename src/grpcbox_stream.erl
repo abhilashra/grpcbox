@@ -59,9 +59,7 @@
                 stream_id           :: stream_id(),
                 method              :: #method{} | undefined,
                 stats_handler       :: module() | undefined,
-                stats               :: term() | undefined,
-                transaction_id      :: binary() | undefined,
-                request_start_time  :: integer() | undefined}).
+                stats               :: term() | undefined}).
 
 -type t() :: #state{}.
 
@@ -97,9 +95,7 @@ init(Conn, StreamId, [Socket, ServicesTable, AuthFun, UnaryInterceptor,
                    stream_interceptor=StreamInterceptor,
                    socket=Socket,
                    handler=self(),
-                   stats_handler=StatsHandler,
-                   transaction_id=undefined,
-                   request_start_time=undefined},
+                   stats_handler=StatsHandler},
     {ok, State}.
 
 on_receive_headers(Headers, State=#state{ctx=_Ctx}) ->
@@ -128,18 +124,16 @@ on_receive_headers(Headers, State=#state{ctx=_Ctx}) ->
                    {<<"content-type">>, content_type(ContentType)}
                    | response_encoding(ResponseEncoding)],
 
-    %% Extract X-REQUEST-ID from headers for response logging
-    TransactionId = proplists:get_value(<<"x-request-id">>, Headers, undefined),
-    RequestStartTime = erlang:monotonic_time(microsecond),
+    %% Store X-REQUEST-ID and start time in process dictionary for response logging
+    put(grpc_x_request_id, proplists:get_value(<<"x-request-id">>, Headers, undefined)),
+    put(grpc_request_start_time, erlang:monotonic_time(microsecond)),
 
     handle_service_lookup(Ctx2, string:lexemes(FullPath, "/"),
                           State1#state{resp_headers=RespHeaders,
                                        req_headers=Headers,
                                        request_encoding=RequestEncoding,
                                        response_encoding=ResponseEncoding,
-                                       content_type=ContentType,
-                                       transaction_id=TransactionId,
-                                       request_start_time=RequestStartTime}).
+                                       content_type=ContentType}).
 
 handle_service_lookup(Ctx, [Service, Method], State=#state{services_table=ServicesTable}) ->
     case ets:lookup(ServicesTable, {Service, Method}) of
@@ -351,15 +345,18 @@ end_stream(Status, Message, State=#state{connection=Conn,
                                          stream_id=StreamId,
                                          ctx=Ctx,
                                          resp_trailers=Trailers,
-                                         transaction_id=TransactionId,
-                                         request_start_time=StartTime,
                                          full_method=FullMethod}) ->
+    T1 = erlang:monotonic_time(millisecond),
     EncodedTrailers = grpcbox_utils:encode_headers(Trailers),
+    T2 = erlang:monotonic_time(millisecond),
     h2_connection:send_trailers(Conn, StreamId, [{<<"grpc-status">>, Status},
                                                     {<<"grpc-message">>, Message} | EncodedTrailers],
                                 [{send_end_stream, true}]),
-    %% Log gRPC response with transaction_id and elapsed time
-    log_grpc_response(TransactionId, StartTime, FullMethod, StreamId, Status),
+    T3 = erlang:monotonic_time(millisecond),
+    io:format("grpc_trailer_timing: stream_id=~p|encode_trailers=~pms|send_trailers=~pms~n",
+              [StreamId, T2-T1, T3-T2]),
+    %% Log gRPC response with x-request-id and elapsed time (from process dictionary)
+    log_grpc_response(get(grpc_x_request_id), get(grpc_request_start_time), FullMethod, StreamId, Status),
     Ctx1 = ctx:with_value(Ctx, grpc_server_status, grpcbox_utils:status_to_string(Status)),
     State1 = stats_handler(Ctx1, rpc_end, {}, State),
     {ok, State1#state{trailers_sent=true}}.
@@ -381,8 +378,13 @@ send_headers(Metadata, State=#state{connection=Conn,
                                     stream_id=StreamId,
                                     resp_headers=Headers,
                                     headers_sent=false}) ->
+    T1 = erlang:monotonic_time(millisecond),
     MdHeaders = grpcbox_utils:encode_headers(Metadata),
+    T2 = erlang:monotonic_time(millisecond),
     h2_connection:send_headers(Conn, StreamId, Headers ++ MdHeaders, [{send_end_stream, false}]),
+    T3 = erlang:monotonic_time(millisecond),
+    io:format("grpc_headers_timing: stream_id=~p|encode=~pms|send_headers=~pms~n",
+              [StreamId, T2-T1, T3-T2]),
     State#state{headers_sent=true}.
 
 code_to_status(0) -> ?GRPC_STATUS_OK;
@@ -470,9 +472,15 @@ send(End, Message, State=#state{ctx=Ctx,
                                 method=#method{proto=Proto,
                                                input={_Input, _},
                                                output={Output, _}}}) ->
+    T1 = erlang:monotonic_time(millisecond),
     BodyToSend = Proto:encode_msg(Message, Output),
+    T2 = erlang:monotonic_time(millisecond),
     OutFrame = grpcbox_frame:encode(Encoding, BodyToSend),
+    T3 = erlang:monotonic_time(millisecond),
     ok = h2_connection:send_body(Conn, StreamId, OutFrame, [{send_end_stream, End}]),
+    T4 = erlang:monotonic_time(millisecond),
+    io:format("grpc_send_timing: stream_id=~p|encode=~pms|frame=~pms|send_body=~pms~n",
+              [StreamId, T2-T1, T3-T2, T4-T3]),
     stats_handler(Ctx, out_payload, #{uncompressed_size => erlang:external_size(Message),
                                       compressed_size => size(BodyToSend)}, State).
 
