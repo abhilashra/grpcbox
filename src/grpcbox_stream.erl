@@ -18,7 +18,8 @@
          ctx/2,
          handle_streams/2,
          handle_call/2,
-         handle_info/2]).
+         handle_info/2,
+         patched_version/0]).
 
 -export([init/3,
          on_receive_headers/2,
@@ -349,9 +350,10 @@ end_stream(Status, Message, State=#state{connection=Conn,
     T1 = erlang:monotonic_time(millisecond),
     EncodedTrailers = grpcbox_utils:encode_headers(Trailers),
     T2 = erlang:monotonic_time(millisecond),
-    %% Use actually_send_trailers to bypass flow control blocking
-    h2_connection:actually_send_trailers(Conn, StreamId, [{<<"grpc-status">>, Status},
-                                                          {<<"grpc-message">>, Message} | EncodedTrailers]),
+    %% Use send_trailers with proper flow control (chatterbox fix handles performance)
+    h2_connection:send_trailers(Conn, StreamId, [{<<"grpc-status">>, Status},
+                                                 {<<"grpc-message">>, Message} | EncodedTrailers],
+                                [{send_end_stream, true}]),
     T3 = erlang:monotonic_time(millisecond),
     io:format("grpc_trailer_timing: stream_id=~p|encode_trailers=~pms|send_trailers=~pms~n",
               [StreamId, T2-T1, T3-T2]),
@@ -582,3 +584,7 @@ log_grpc_response(RequestId, StartTime, FullMethod, StreamId, Status) ->
                    end,
     io:format("grpc_response: x_request_id=~s|stream_id=~p|method=~s|status=~s|elapsed_ms=~p~n",
               [RequestIdStr, StreamId, FullMethod, Status, ElapsedMs]).
+
+%% Function to verify patched version is loaded
+patched_version() ->
+    <<"grpcbox_stream_patched_v5_send_trailers_with_chatterbox_fix">>.
