@@ -99,6 +99,8 @@ init(Conn, StreamId, [Socket, ServicesTable, AuthFun, UnaryInterceptor,
     {ok, State}.
 
 on_receive_headers(Headers, State=#state{ctx=_Ctx}) ->
+    %% Store request start time for drp_elapsed_ms header
+    put(grpc_request_start_time, erlang:monotonic_time(microsecond)),
     %% proplists:get_value(<<":method">>, Headers) =:= <<"POST">>,
     Metadata = grpcbox_utils:headers_to_metadata(Headers),
     Ctx = case parse_options(<<"grpc-timeout">>, Headers) of
@@ -341,7 +343,14 @@ end_stream(Status, Message, State=#state{connection=Conn,
                                          stream_id=StreamId,
                                          ctx=Ctx,
                                          resp_trailers=Trailers}) ->
-    EncodedTrailers = grpcbox_utils:encode_headers(Trailers),
+    %% Calculate elapsed time and add drp_elapsed_ms trailer
+    ElapsedMs = case get(grpc_request_start_time) of
+                    undefined -> <<"0">>;
+                    StartTime -> 
+                        integer_to_binary((erlang:monotonic_time(microsecond) - StartTime) div 1000)
+                end,
+    TrailersWithElapsed = [{<<"drp_elapsed_ms">>, ElapsedMs} | Trailers],
+    EncodedTrailers = grpcbox_utils:encode_headers(TrailersWithElapsed),
     h2_connection:send_trailers(Conn, StreamId, [{<<"grpc-status">>, Status},
                                                     {<<"grpc-message">>, Message} | EncodedTrailers],
                                 [{send_end_stream, true}]),
