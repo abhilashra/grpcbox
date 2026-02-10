@@ -226,7 +226,18 @@ from_ctx(Ctx) ->
 on_receive_data(_, State=#state{method=undefined}) ->
     {ok, State};
 on_receive_data(Bin, State=#state{request_encoding=Encoding,
-                                  buffer=Buffer}) ->
+                                  buffer=Buffer,
+                                  stream_id=StreamId}) ->
+    %% Log time since headers received (to understand delay before data arrives)
+    case get(grpc_request_start_time) of
+        undefined -> ok;
+        StartTime ->
+            DataArrivalDelay = (erlang:monotonic_time(microsecond) - StartTime) div 1000,
+            case DataArrivalDelay > 50 of
+                true -> io:format("grpc_data_arrival: stream_id=~p|delay_since_headers=~pms~n", [StreamId, DataArrivalDelay]);
+                false -> ok
+            end
+    end,
     try
         {NewBuffer, Messages} = grpcbox_frame:split(<<Buffer/binary, Bin/binary>>, Encoding),
         State1 = lists:foldl(fun(EncodedMessage, StateAcc=#state{}) ->
@@ -274,11 +285,18 @@ handle_message(EncodedMessage, State=#state{input_ref=Ref,
 
 handle_unary(Ctx, Message, State=#state{unary_interceptor=UnaryInterceptor,
                                         full_method=FullMethod,
+                                        stream_id=StreamId,
                                         method=#method{module=Module,
                                                        function=Function,
                                                        proto=_Proto,
                                                        input={_Input, _InputStream},
                                                        output={_Output, _OutputStream}}}) ->
+    %% Log time since headers received (before handler call)
+    HandlerStartDelay = case get(grpc_request_start_time) of
+        undefined -> 0;
+        ST -> (erlang:monotonic_time(microsecond) - ST) div 1000
+    end,
+    T1 = erlang:monotonic_time(millisecond),
     Ctx1 = ctx_with_stream(Ctx, State),
     case (case UnaryInterceptor of
               undefined -> Module:Function(Ctx1, Message);
@@ -289,6 +307,14 @@ handle_unary(Ctx, Message, State=#state{unary_interceptor=UnaryInterceptor,
                                    fun Module:Function/2)
           end) of
         {ok, Response, Ctx2} ->
+            T2 = erlang:monotonic_time(millisecond),
+            HandlerTime = T2 - T1,
+            %% Log timing breakdown if total delay > 50ms
+            case HandlerStartDelay > 50 of
+                true -> io:format("grpc_handler_timing: stream_id=~p|delay_before_handler=~pms|handler_time=~pms~n",
+                                  [StreamId, HandlerStartDelay, HandlerTime]);
+                false -> ok
+            end,
             State1 = from_ctx(Ctx2),
             send(false, Response, State1);
         E={grpc_error, _} ->
@@ -347,18 +373,12 @@ end_stream(Status, Message, State=#state{connection=Conn,
                                          ctx=Ctx,
                                          resp_trailers=Trailers,
                                          full_method=FullMethod}) ->
-    T1 = erlang:monotonic_time(millisecond),
     EncodedTrailers = grpcbox_utils:encode_headers(Trailers),
-    T2 = erlang:monotonic_time(millisecond),
-    %% Use send_trailers with proper flow control (chatterbox fix handles performance)
     h2_connection:send_trailers(Conn, StreamId, [{<<"grpc-status">>, Status},
                                                  {<<"grpc-message">>, Message} | EncodedTrailers],
                                 [{send_end_stream, true}]),
-    T3 = erlang:monotonic_time(millisecond),
-    io:format("grpc_trailer_timing: stream_id=~p|encode_trailers=~pms|send_trailers=~pms~n",
-              [StreamId, T2-T1, T3-T2]),
-    %% Log gRPC response with x-request-id and elapsed time (from process dictionary)
-    log_grpc_response(get(grpc_x_request_id), get(grpc_request_start_time), FullMethod, StreamId, Status),
+    %% Log gRPC response only if elapsed > 50ms
+    log_grpc_response_if_slow(get(grpc_x_request_id), get(grpc_request_start_time), FullMethod, StreamId, Status),
     Ctx1 = ctx:with_value(Ctx, grpc_server_status, grpcbox_utils:status_to_string(Status)),
     State1 = stats_handler(Ctx1, rpc_end, {}, State),
     {ok, State1#state{trailers_sent=true}}.
@@ -380,13 +400,8 @@ send_headers(Metadata, State=#state{connection=Conn,
                                     stream_id=StreamId,
                                     resp_headers=Headers,
                                     headers_sent=false}) ->
-    T1 = erlang:monotonic_time(millisecond),
     MdHeaders = grpcbox_utils:encode_headers(Metadata),
-    T2 = erlang:monotonic_time(millisecond),
     h2_connection:send_headers(Conn, StreamId, Headers ++ MdHeaders, [{send_end_stream, false}]),
-    T3 = erlang:monotonic_time(millisecond),
-    io:format("grpc_headers_timing: stream_id=~p|encode=~pms|send_headers=~pms~n",
-              [StreamId, T2-T1, T3-T2]),
     State#state{headers_sent=true}.
 
 code_to_status(0) -> ?GRPC_STATUS_OK;
@@ -474,15 +489,9 @@ send(End, Message, State=#state{ctx=Ctx,
                                 method=#method{proto=Proto,
                                                input={_Input, _},
                                                output={Output, _}}}) ->
-    T1 = erlang:monotonic_time(millisecond),
     BodyToSend = Proto:encode_msg(Message, Output),
-    T2 = erlang:monotonic_time(millisecond),
     OutFrame = grpcbox_frame:encode(Encoding, BodyToSend),
-    T3 = erlang:monotonic_time(millisecond),
     ok = h2_connection:send_body(Conn, StreamId, OutFrame, [{send_end_stream, End}]),
-    T4 = erlang:monotonic_time(millisecond),
-    io:format("grpc_send_timing: stream_id=~p|encode=~pms|frame=~pms|send_body=~pms~n",
-              [StreamId, T2-T1, T3-T2, T4-T3]),
     stats_handler(Ctx, out_payload, #{uncompressed_size => erlang:external_size(Message),
                                       compressed_size => size(BodyToSend)}, State).
 
@@ -572,19 +581,23 @@ add_trailers_from_error_data(ErrorData, State) ->
     Trailers = maps:get(trailers, ErrorData, #{}),
     update_trailers(maps:to_list(Trailers), State).
 
-%% Log gRPC response at HTTP/2 level with x-request-id and timing
-log_grpc_response(RequestId, StartTime, FullMethod, StreamId, Status) ->
-    ElapsedMs = case StartTime of
-                    undefined -> 0;
-                    _ -> (erlang:monotonic_time(microsecond) - StartTime) div 1000
-                end,
-    RequestIdStr = case RequestId of
-                       undefined -> <<"N/A">>;
-                       _ -> RequestId
-                   end,
-    io:format("grpc_response: x_request_id=~s|stream_id=~p|method=~s|status=~s|elapsed_ms=~p~n",
-              [RequestIdStr, StreamId, FullMethod, Status, ElapsedMs]).
+%% Log gRPC response only if elapsed > 50ms
+log_grpc_response_if_slow(_RequestId, undefined, _FullMethod, _StreamId, _Status) ->
+    ok;
+log_grpc_response_if_slow(RequestId, StartTime, FullMethod, StreamId, Status) ->
+    ElapsedMs = (erlang:monotonic_time(microsecond) - StartTime) div 1000,
+    case ElapsedMs > 50 of
+        true ->
+            RequestIdStr = case RequestId of
+                               undefined -> <<"N/A">>;
+                               _ -> RequestId
+                           end,
+            io:format("grpc_slow_response: x_request_id=~s|stream_id=~p|method=~s|status=~s|elapsed_ms=~p~n",
+                      [RequestIdStr, StreamId, FullMethod, Status, ElapsedMs]);
+        false ->
+            ok
+    end.
 
 %% Function to verify patched version is loaded
 patched_version() ->
-    <<"grpcbox_stream_patched_v5_send_trailers_with_chatterbox_fix">>.
+    <<"grpcbox_stream_patched_v7_slow_requests_only">>.
