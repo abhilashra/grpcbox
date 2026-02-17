@@ -335,21 +335,47 @@ stats_handler(Ctx, Event, Stats, State=#state{stats_handler=StatsHandler,
 end_stream(State) ->
     end_stream(?GRPC_STATUS_OK, <<>>, State).
 
+%% Trailers-Only response (gRPC HTTP/2 spec): when no headers/data sent yet
+%% AND status is not OK, combine response headers + grpc-status + trailers
+%% into a single HEADERS frame with END_STREAM. This lets Envoy see the error
+%% in the first frame and trigger retries.
+end_stream(Status, Message, State=#state{headers_sent=false,
+                                         connection=Conn,
+                                         stream_id=StreamId,
+                                         ctx=Ctx,
+                                         resp_headers=RespHeaders,
+                                         resp_trailers=Trailers})
+        when Status =/= ?GRPC_STATUS_OK ->
+    ElapsedMs = case get(grpc_request_start_time) of
+                    undefined -> <<"0">>;
+                    StartTime ->
+                        integer_to_binary((erlang:monotonic_time(microsecond) - StartTime) div 1000)
+                end,
+    TrailersWithElapsed = [{<<"x-drp-elapsed-ms">>, ElapsedMs} | Trailers],
+    EncodedTrailers = grpcbox_utils:encode_headers(TrailersWithElapsed),
+    AllHeaders = RespHeaders ++
+                 [{<<"grpc-status">>, Status},
+                  {<<"grpc-message">>, Message} | EncodedTrailers],
+    h2_connection:send_headers(Conn, StreamId, AllHeaders, [{send_end_stream, true}]),
+    Ctx1 = ctx:with_value(Ctx, grpc_server_status, grpcbox_utils:status_to_string(Status)),
+    State1 = stats_handler(Ctx1, rpc_end, {}, State),
+    {ok, State1#state{headers_sent=true, trailers_sent=true}};
+%% Normal OK case: send headers first, then trailers separately
 end_stream(Status, Message, State=#state{headers_sent=false}) ->
     end_stream(Status, Message, send_headers(State));
 end_stream(_Status, _Message, State=#state{trailers_sent=true}) ->
     {ok, State};
+%% Headers already sent: send trailers in separate frame
 end_stream(Status, Message, State=#state{connection=Conn,
                                          stream_id=StreamId,
                                          ctx=Ctx,
                                          resp_trailers=Trailers}) ->
-    %% Calculate elapsed time and add drp_elapsed_ms trailer
     ElapsedMs = case get(grpc_request_start_time) of
                     undefined -> <<"0">>;
-                    StartTime -> 
+                    StartTime ->
                         integer_to_binary((erlang:monotonic_time(microsecond) - StartTime) div 1000)
                 end,
-    TrailersWithElapsed = [{<<"drp_elapsed_ms">>, ElapsedMs} | Trailers],
+    TrailersWithElapsed = [{<<"x-drp-elapsed-ms">>, ElapsedMs} | Trailers],
     EncodedTrailers = grpcbox_utils:encode_headers(TrailersWithElapsed),
     h2_connection:send_trailers(Conn, StreamId, [{<<"grpc-status">>, Status},
                                                     {<<"grpc-message">>, Message} | EncodedTrailers],
