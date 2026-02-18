@@ -238,7 +238,8 @@ on_receive_data(Bin, State=#state{request_encoding=Encoding,
             State2 = add_trailers_from_error_data(ErrorData, State),
             end_stream(Status, Message, State2);
         C:E:S ->
-            ?LOG_INFO("crash: class=~p exception=~p stacktrace=~p", [C, E, S]),
+            ?LOG_ERROR("grpc_unknown_error: stream_id=~p method=~p class=~p exception=~p stacktrace=~p",
+                       [State#state.stream_id, State#state.full_method, C, E, S]),
             end_stream(?GRPC_STATUS_UNKNOWN, <<>>, State)
     end.
 
@@ -427,7 +428,9 @@ handle_info({'EXIT', _, {grpc_extended_error, #{status := Status, message := Mes
     State1 = add_trailers_from_error_data(ErrorData, State),
     end_stream(Status, Message, State1),
     State1;
-handle_info({'EXIT', _, _Other}, State) ->
+handle_info({'EXIT', Pid, Other}, State) ->
+    ?LOG_ERROR("grpc_unknown_exit: stream_id=~p method=~p pid=~p reason=~p",
+              [State#state.stream_id, State#state.full_method, Pid, Other]),
     end_stream(?GRPC_STATUS_UNKNOWN, <<"process exited without reason">>, State),
     State;
 handle_info({timeout,_Ref,<<"grpc-timeout">>}, State) ->
@@ -464,7 +467,12 @@ send(End, Message, State=#state{ctx=Ctx,
                                 method=#method{proto=Proto,
                                                input={_Input, _},
                                                output={Output, _}}}) ->
-    BodyToSend = Proto:encode_msg(Message, Output),
+    BodyToSend = try Proto:encode_msg(Message, Output)
+                 catch C:E:S ->
+                     ?LOG_ERROR("grpc_encode_error: stream_id=~p output=~p class=~p exception=~p stacktrace=~p",
+                                [StreamId, Output, C, E, S]),
+                     erlang:raise(C, E, S)
+                 end,
     OutFrame = grpcbox_frame:encode(Encoding, BodyToSend),
     ok = h2_connection:send_body(Conn, StreamId, OutFrame, [{send_end_stream, End}]),
     stats_handler(Ctx, out_payload, #{uncompressed_size => erlang:external_size(Message),
