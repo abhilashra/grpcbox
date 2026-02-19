@@ -99,7 +99,7 @@ init(Conn, StreamId, [Socket, ServicesTable, AuthFun, UnaryInterceptor,
     {ok, State}.
 
 on_receive_headers(Headers, State=#state{ctx=_Ctx}) ->
-    %% Store request start time for drp_elapsed_ms header
+    %% Store request start time for x-drp-elapsed-ms trailer
     put(grpc_request_start_time, erlang:monotonic_time(microsecond)),
     %% proplists:get_value(<<":method">>, Headers) =:= <<"POST">>,
     Metadata = grpcbox_utils:headers_to_metadata(Headers),
@@ -344,7 +344,7 @@ end_stream(Status, Message, State=#state{connection=Conn,
                                          stream_id=StreamId,
                                          ctx=Ctx,
                                          resp_trailers=Trailers}) ->
-    %% Calculate elapsed time and add drp_elapsed_ms trailer
+    %% Calculate elapsed time and add x-drp-elapsed-ms trailer
     ElapsedMs = case get(grpc_request_start_time) of
                     undefined -> <<"0">>;
                     StartTime -> 
@@ -419,23 +419,23 @@ handle_info({add_trailers, Trailers}, State) ->
 handle_info({send_proto, Message}, State) ->
     send(false, Message, State);
 handle_info({'EXIT', _, normal}, State) ->
-    end_stream(State),
-    State;
+    {ok, State1} = end_stream(State),
+    State1;
 handle_info({'EXIT', _, {grpc_error, {Status, Message}}}, State) ->
-    end_stream(Status, Message, State),
-    State;
+    {ok, State1} = end_stream(Status, Message, State),
+    State1;
 handle_info({'EXIT', _, {grpc_extended_error, #{status := Status, message := Message} = ErrorData}}, State) ->
     State1 = add_trailers_from_error_data(ErrorData, State),
-    end_stream(Status, Message, State1),
-    State1;
+    {ok, State2} = end_stream(Status, Message, State1),
+    State2;
 handle_info({'EXIT', Pid, Other}, State) ->
     ?LOG_ERROR("grpc_unknown_exit: stream_id=~p method=~p pid=~p reason=~p",
               [State#state.stream_id, State#state.full_method, Pid, Other]),
-    end_stream(?GRPC_STATUS_UNKNOWN, <<"process exited without reason">>, State),
-    State;
+    {ok, State1} = end_stream(?GRPC_STATUS_UNKNOWN, <<"process exited without reason">>, State),
+    State1;
 handle_info({timeout,_Ref,<<"grpc-timeout">>}, State) ->
-    end_stream(?GRPC_STATUS_DEADLINE_EXCEEDED, <<"Deadline expired">>, State),
-    State;
+    {ok, State1} = end_stream(?GRPC_STATUS_DEADLINE_EXCEEDED, <<"Deadline expired">>, State),
+    State1;
 handle_info(_, State) ->
     State.
 
