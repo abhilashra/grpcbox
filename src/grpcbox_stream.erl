@@ -350,7 +350,7 @@ end_stream(Status, Message, State=#state{connection=Conn,
                     StartTime -> 
                         integer_to_binary((erlang:monotonic_time(microsecond) - StartTime) div 1000)
                 end,
-    TrailersWithElapsed = [{<<"drp_elapsed_ms">>, ElapsedMs} | Trailers],
+    TrailersWithElapsed = [{<<"x-drp-elapsed-ms">>, ElapsedMs} | Trailers],
     EncodedTrailers = grpcbox_utils:encode_headers(TrailersWithElapsed),
     h2_connection:send_trailers(Conn, StreamId, [{<<"grpc-status">>, Status},
                                                     {<<"grpc-message">>, Message} | EncodedTrailers],
