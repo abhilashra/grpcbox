@@ -240,7 +240,15 @@ on_receive_data(Bin, State=#state{request_encoding=Encoding,
         C:E:S ->
             ?LOG_ERROR("grpc_unknown_error: stream_id=~p method=~p class=~p exception=~p stacktrace=~p",
                        [State#state.stream_id, State#state.full_method, C, E, S]),
-            end_stream(?GRPC_STATUS_UNKNOWN, <<>>, State)
+            %% Check process dict flag to avoid double-send when the successful
+            %% response (headers+body+trailers) already went out but a late
+            %% crash was caught with the original (stale) State.
+            case get(grpc_trailers_sent) of
+                true ->
+                    {ok, State#state{trailers_sent=true}};
+                _ ->
+                    end_stream(?GRPC_STATUS_UNKNOWN, <<>>, State)
+            end
     end.
 
 handle_message(EncodedMessage, State=#state{input_ref=Ref,
@@ -344,17 +352,27 @@ end_stream(Status, Message, State=#state{connection=Conn,
                                          stream_id=StreamId,
                                          ctx=Ctx,
                                          resp_trailers=Trailers}) ->
-    %% Calculate elapsed time and add x-drp-elapsed-ms trailer
-    ElapsedMs = case get(grpc_request_start_time) of
-                    undefined -> <<"0">>;
-                    StartTime -> 
-                        integer_to_binary((erlang:monotonic_time(microsecond) - StartTime) div 1000)
+    %% Use app-set elapsed time if available (accurate), otherwise calculate here
+    AppElapsed = proplists:get_value(<<"x-drp-elapsed-ms">>, Trailers, undefined),
+    ElapsedMs = case AppElapsed of
+                    undefined ->
+                        case get(grpc_request_start_time) of
+                            undefined -> <<"0">>;
+                            StartTime ->
+                                integer_to_binary(max(1, (erlang:monotonic_time(microsecond) - StartTime) div 1000))
+                        end;
+                    Val -> Val
                 end,
-    TrailersWithElapsed = [{<<"x-drp-elapsed-ms">>, ElapsedMs} | Trailers],
+    FilteredTrailers = [{K, V} || {K, V} <- Trailers,
+                                   K =/= <<"x-drp-elapsed-ms">>],
+    TrailersWithElapsed = [{<<"x-drp-elapsed-ms">>, ElapsedMs} | FilteredTrailers],
     EncodedTrailers = grpcbox_utils:encode_headers(TrailersWithElapsed),
     h2_connection:send_trailers(Conn, StreamId, [{<<"grpc-status">>, Status},
                                                     {<<"grpc-message">>, Message} | EncodedTrailers],
                                 [{send_end_stream, true}]),
+    %% Mark trailers sent in process dict so catch blocks with stale State
+    %% can detect that trailers already went out (prevents double-send)
+    put(grpc_trailers_sent, true),
     Ctx1 = ctx:with_value(Ctx, grpc_server_status, grpcbox_utils:status_to_string(Status)),
     State1 = stats_handler(Ctx1, rpc_end, {}, State),
     {ok, State1#state{trailers_sent=true}}.
