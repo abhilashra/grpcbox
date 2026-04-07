@@ -20,7 +20,11 @@
 -export([
     count_rpc_started/1,
     count_rpc_handled/2,
-    observe_rpc_latency/2
+    observe_rpc_latency/2,
+    inc_active_requests/0,
+    dec_active_requests/0,
+    get_active_requests/0,
+    count_rate_limit_rejection/0
 ]).
 
 -define(SERVER_STARTED, grpc_server_started_total).
@@ -79,3 +83,38 @@ latency_bucket(LatencyMs) when LatencyMs < 200 ->
     <<"medium_100_200ms">>;
 latency_bucket(_LatencyMs) ->
     <<"slow_ge_200ms">>.
+
+%%-------------------------------------------------------------------------
+%% Active Requests Tracking (for rate limiting)
+%%-------------------------------------------------------------------------
+
+-define(ACTIVE_REQUESTS, grpc_server_active_requests).
+-define(RATE_LIMIT_REJECTIONS, grpc_rate_limit_rejections_total).
+
+%% Increment active requests counter
+-spec inc_active_requests() -> ok.
+inc_active_requests() ->
+    catch prometheus_gauge:inc(?ACTIVE_REQUESTS),
+    ok.
+
+%% Decrement active requests counter
+-spec dec_active_requests() -> ok.
+dec_active_requests() ->
+    catch prometheus_gauge:dec(?ACTIVE_REQUESTS),
+    ok.
+
+%% Get current active requests count
+-spec get_active_requests() -> non_neg_integer().
+get_active_requests() ->
+    try prometheus_gauge:value(?ACTIVE_REQUESTS) of
+        Val when is_number(Val) -> max(0, round(Val));
+        _ -> 0
+    catch
+        _:_ -> 0
+    end.
+
+%% Count rate limit rejection
+-spec count_rate_limit_rejection() -> ok.
+count_rate_limit_rejection() ->
+    catch prometheus_counter:inc(?RATE_LIMIT_REJECTIONS),
+    ok.

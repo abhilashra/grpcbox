@@ -28,7 +28,7 @@
 %%%-------------------------------------------------------------------------
 -module(grpcbox_prometheus_handler).
 
--export([handle/5]).
+-export([handle/5, check_and_increment/0, check_and_increment/1, get_active_requests/0]).
 
 -record(stats, {
     start_time :: integer() | undefined
@@ -56,3 +56,30 @@ handle(Ctx, server, rpc_end, _, Stats = #stats{start_time = StartTime}) ->
 %% Catch-all for unhandled events (client events, in_payload, out_payload, etc.)
 handle(Ctx, _, _, _, Stats) ->
     {Ctx, Stats}.
+
+%%-------------------------------------------------------------------------
+%% Rate Limiting API
+%%-------------------------------------------------------------------------
+
+%% Get current active requests count
+-spec get_active_requests() -> non_neg_integer().
+get_active_requests() ->
+    grpcbox_prometheus:get_active_requests().
+
+%% Check limit and increment if under limit (uses default high_load from lookup_engine app)
+-spec check_and_increment() -> ok | {reject, non_neg_integer(), non_neg_integer()}.
+check_and_increment() ->
+    HighLoad = application:get_env(lookup_engine, high_load, 150),
+    check_and_increment(HighLoad).
+
+%% Check limit and increment if under limit (with explicit limit)
+-spec check_and_increment(non_neg_integer()) -> ok | {reject, non_neg_integer(), non_neg_integer()}.
+check_and_increment(HighLoad) ->
+    ActiveCount = grpcbox_prometheus:get_active_requests(),
+    if
+        ActiveCount >= HighLoad ->
+            {reject, ActiveCount, HighLoad};
+        true ->
+            grpcbox_prometheus:inc_active_requests(),
+            ok
+    end.
