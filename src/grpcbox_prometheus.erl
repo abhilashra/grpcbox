@@ -21,6 +21,7 @@
     count_rpc_started/1,
     count_rpc_handled/2,
     observe_rpc_latency/2,
+    count_latency_bucket/1,
     inc_active_requests/0,
     dec_active_requests/0,
     get_active_requests/0,
@@ -50,6 +51,9 @@ count_rpc_handled(Method, Status) ->
 observe_rpc_latency(Method, LatencyMs) ->
     catch prometheus_histogram:observe(?SERVER_LATENCY_MS, [Method], LatencyMs),
     
+    %% Track latency bucket: fast (<=40ms), medium (40-140ms), slow (>=140ms)
+    count_latency_bucket(LatencyMs),
+    
     %% Track slow requests (>=90ms) and log via lager
     case LatencyMs >= ?SLOW_REQUEST_THRESHOLD_MS of
         true ->
@@ -60,6 +64,20 @@ observe_rpc_latency(Method, LatencyMs) ->
         false ->
             ok
     end,
+    ok.
+
+%% Count gRPC request by latency bucket
+%% Input: Milliseconds
+%% Buckets: fast (<=40ms), medium (40-140ms), slow (>=140ms)
+-spec count_latency_bucket(number()) -> ok.
+count_latency_bucket(LatencyMs) when LatencyMs =< 40 ->
+    catch prometheus_counter:inc(grpc_server_latency_bucket_total, [fast]),
+    ok;
+count_latency_bucket(LatencyMs) when LatencyMs < 140 ->
+    catch prometheus_counter:inc(grpc_server_latency_bucket_total, [medium]),
+    ok;
+count_latency_bucket(_LatencyMs) ->
+    catch prometheus_counter:inc(grpc_server_latency_bucket_total, [slow]),
     ok.
 
 %% Log slow requests using lager (available in hermes-dyn-router)
