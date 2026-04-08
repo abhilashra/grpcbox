@@ -49,7 +49,7 @@ handle(Ctx, server, rpc_end, _, Stats = #stats{start_time = StartTime}) ->
     LatencyMs = EndTime - StartTime,
     
     grpcbox_prometheus:count_rpc_handled(Method, Status),
-    grpcbox_prometheus:observe_rpc_latency(Method, LatencyMs),
+    grpcbox_prometheus:observe_rpc_latency(Method, LatencyMs, Ctx),
     
     {Ctx, Stats};
 

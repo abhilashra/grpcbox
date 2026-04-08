@@ -21,6 +21,7 @@
     count_rpc_started/1,
     count_rpc_handled/2,
     observe_rpc_latency/2,
+    observe_rpc_latency/3,
     count_latency_bucket/1,
     inc_active_requests/0,
     dec_active_requests/0,
@@ -46,9 +47,14 @@ count_rpc_handled(Method, Status) ->
     catch prometheus_counter:inc(?SERVER_HANDLED, [Method, Status]),
     ok.
 
-%% Observe RPC latency (in milliseconds)
+%% Observe RPC latency (in milliseconds) - without context (backward compatible)
 -spec observe_rpc_latency(binary() | string(), number()) -> ok.
 observe_rpc_latency(Method, LatencyMs) ->
+    observe_rpc_latency(Method, LatencyMs, undefined).
+
+%% Observe RPC latency (in milliseconds) - with context for transaction ID
+-spec observe_rpc_latency(binary() | string(), number(), term()) -> ok.
+observe_rpc_latency(Method, LatencyMs, Ctx) ->
     catch prometheus_histogram:observe(?SERVER_LATENCY_MS, [Method], LatencyMs),
     
     %% Track latency bucket: fast (<=40ms), medium (40-140ms), slow (>=140ms)
@@ -60,7 +66,8 @@ observe_rpc_latency(Method, LatencyMs) ->
             catch prometheus_gauge:set(grpc_server_last_slow_request_milliseconds, 
                                       [Method], LatencyMs),
             catch prometheus_counter:inc(grpc_server_slow_requests_total, [Method]),
-            log_slow_request(Method, LatencyMs);
+            TransId = get_transaction_id(Ctx),
+            log_slow_request(Method, LatencyMs, TransId);
         false ->
             ok
     end,
@@ -80,13 +87,29 @@ count_latency_bucket(_LatencyMs) ->
     catch prometheus_counter:inc(grpc_server_latency_bucket_total, [slow]),
     ok.
 
-%% Log slow requests using lager (available in hermes-dyn-router)
--spec log_slow_request(binary() | string(), number()) -> ok.
-log_slow_request(Method, LatencyMs) ->
-    Bucket = latency_bucket(LatencyMs),
+%% Get transaction ID from context metadata
+-spec get_transaction_id(term()) -> binary() | undefined.
+get_transaction_id(undefined) ->
+    undefined;
+get_transaction_id(Ctx) ->
     try
-        lager:warning("grpc_slow_request: method=~s latency_ms=~.2f bucket=~s",
-                      [Method, LatencyMs, Bucket])
+        Metadata = grpcbox_metadata:from_incoming_ctx(Ctx),
+        maps:get(<<"x-sbc-trans-id">>, Metadata, undefined)
+    catch
+        _:_ -> undefined
+    end.
+
+%% Log slow requests using lager (available in hermes-dyn-router)
+-spec log_slow_request(binary() | string(), number(), binary() | undefined) -> ok.
+log_slow_request(Method, LatencyMs, TransId) ->
+    Bucket = latency_bucket(LatencyMs),
+    TransIdStr = case TransId of
+        undefined -> <<"unknown">>;
+        _ -> TransId
+    end,
+    try
+        lager:warning("grpc_slow_request: method=~s latency_ms=~.2f bucket=~s x_sbc_trans_id=~s",
+                      [Method, LatencyMs, Bucket, TransIdStr])
     catch
         _:_ ->
             ok
