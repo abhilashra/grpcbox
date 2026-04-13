@@ -31,7 +31,6 @@
 
 -define(SERVER_STARTED, grpc_server_started_total).
 -define(SERVER_HANDLED, grpc_server_handled_total).
--define(SERVER_LATENCY_MS, grpc_server_handling_milliseconds).
 
 -define(SLOW_REQUEST_THRESHOLD_MS, 90).
 
@@ -54,23 +53,9 @@ observe_rpc_latency(Method, LatencyMs) ->
 
 %% Observe RPC latency (in milliseconds) - with context for transaction ID
 -spec observe_rpc_latency(binary() | string(), number(), term()) -> ok.
-observe_rpc_latency(Method, LatencyMs, Ctx) ->
-    catch prometheus_histogram:observe(?SERVER_LATENCY_MS, [Method], LatencyMs),
-    
+observe_rpc_latency(_Method, LatencyMs, _Ctx) ->
     %% Track latency bucket: fast (<=40ms), medium (40-140ms), slow (>=140ms)
     count_latency_bucket(LatencyMs),
-    
-    %% Track slow requests (>=90ms) and log via lager
-    case LatencyMs >= ?SLOW_REQUEST_THRESHOLD_MS of
-        true ->
-            catch prometheus_gauge:set(grpc_server_last_slow_request_milliseconds, 
-                                      [Method], LatencyMs),
-            catch prometheus_counter:inc(grpc_server_slow_requests_total, [Method]),
-            TransId = get_transaction_id(Ctx),
-            log_slow_request(Method, LatencyMs, TransId);
-        false ->
-            ok
-    end,
     ok.
 
 %% Count gRPC request by latency bucket
