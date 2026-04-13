@@ -108,8 +108,8 @@ log_slow_request(Method, LatencyMs, TransId) ->
         _ -> TransId
     end,
     try
-        lager:warning("grpc_slow_request: method=~s latency_ms=~.2f bucket=~s x_sbc_trans_id=~s",
-                      [Method, LatencyMs, Bucket, TransIdStr])
+        lager:debug("grpc_slow_request: method=~s latency_ms=~.2f bucket=~s x_sbc_trans_id=~s",
+                    [Method, LatencyMs, Bucket, TransIdStr])
     catch
         _:_ ->
             ok
