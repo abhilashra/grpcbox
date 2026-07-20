@@ -276,14 +276,17 @@ handle_unary(Ctx, Message, State=#state{unary_interceptor=UnaryInterceptor,
                                                        input={_Input, _InputStream},
                                                        output={_Output, _OutputStream}}}) ->
     Ctx1 = ctx_with_stream(Ctx, State),
-    case (case UnaryInterceptor of
-              undefined -> Module:Function(Ctx1, Message);
-              _ ->
-                  ServerInfo = #{full_method => FullMethod,
-                                 service => Module},
-                  UnaryInterceptor(Ctx1, Message, ServerInfo,
-                                   fun Module:Function/2)
-          end) of
+    Handler = fun() ->
+                      case UnaryInterceptor of
+                          undefined -> Module:Function(Ctx1, Message);
+                          _ ->
+                              ServerInfo = #{full_method => FullMethod,
+                                             service => Module},
+                              UnaryInterceptor(Ctx1, Message, ServerInfo,
+                                               fun Module:Function/2)
+                      end
+              end,
+    case run_unary_handler(Handler, State) of
         {ok, Response, Ctx2} ->
             State1 = from_ctx(Ctx2),
             send(false, Response, State1);
@@ -291,6 +294,46 @@ handle_unary(Ctx, Message, State=#state{unary_interceptor=UnaryInterceptor,
             throw(E);
         E={grpc_extended_error, _} ->
             throw(E)
+    end.
+
+%% Run a unary handler in a spawned, monitored worker so a handler that
+%% blocks or loops forever cannot wedge the h2_stream process. The stream
+%% process owns the transport (socket writes, hpack encode context, the
+%% grpc-timeout deadline timer), so it must never be the process that gets
+%% stuck or killed; the worker touches none of those and is safe to kill.
+%% Configure the cap with {grpcbox, unary_handler_timeout_ms} (ms or the
+%% atom infinity, default 5000).
+run_unary_handler(Handler, #state{stream_id=StreamId, full_method=FullMethod}) ->
+    TimeoutMs = application:get_env(grpcbox, unary_handler_timeout_ms, 5000),
+    Parent = self(),
+    Ref = make_ref(),
+    {Pid, MRef} = erlang:spawn_monitor(fun() -> Parent ! {Ref, Handler()} end),
+    receive
+        {Ref, Result} ->
+            erlang:demonitor(MRef, [flush]),
+            Result;
+        %% preserve pre-worker semantics for handlers that terminate with a
+        %% grpc error instead of returning one
+        {'DOWN', MRef, process, Pid, E={grpc_error, _}} ->
+            E;
+        {'DOWN', MRef, process, Pid, E={grpc_extended_error, _}} ->
+            E;
+        {'DOWN', MRef, process, Pid, {{nocatch, E={grpc_error, _}}, _}} ->
+            E;
+        {'DOWN', MRef, process, Pid, {{nocatch, E={grpc_extended_error, _}}, _}} ->
+            E;
+        {'DOWN', MRef, process, Pid, Reason} ->
+            ?LOG_ERROR("grpc_handler_crash: stream_id=~p method=~p reason=~p",
+                       [StreamId, FullMethod, Reason]),
+            {grpc_error, {?GRPC_STATUS_UNKNOWN, <<"handler crashed">>}}
+    after TimeoutMs ->
+        erlang:exit(Pid, kill),
+        erlang:demonitor(MRef, [flush]),
+        %% drain a result that raced the kill
+        receive {Ref, _} -> ok after 0 -> ok end,
+        ?LOG_ERROR("grpc_handler_timeout: stream_id=~p method=~p timeout_ms=~p",
+                   [StreamId, FullMethod, TimeoutMs]),
+        {grpc_error, {?GRPC_STATUS_DEADLINE_EXCEEDED, <<"handler timeout">>}}
     end.
 
 on_end_stream(State) ->
